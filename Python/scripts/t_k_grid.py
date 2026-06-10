@@ -13,8 +13,8 @@ import pandas as pd
 import phate
 from matplotlib import pyplot as plt
 
-INPUT = "tree_50k.parquet"
-OUTDIR = "plots"
+INPUT = "./tree_50k.parquet"
+OUTDIR = "./plots"
 T_VALUES = list(range(1, 11))
 K_VALUES = [10, 50, 100]
 

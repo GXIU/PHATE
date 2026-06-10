@@ -12,7 +12,7 @@ import numpy as np
 import phate
 from matplotlib import pyplot as plt
 
-OUTDIR = "plots"
+OUTDIR = "./plots"
 os.makedirs(OUTDIR, exist_ok=True)
 
 # Small tree for quick dense runs
