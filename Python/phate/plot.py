@@ -2,7 +2,6 @@
 # (C) 2017 Krishnaswamy Lab GPLv2
 
 # Plotting convenience functions
-from __future__ import print_function, division
 from .phate import PHATE
 
 try:
@@ -43,8 +42,6 @@ def _get_plot_data(data, ndim=None):
             out = data.transform()
         else:
             raise ValueError(
-                "Expected at least {}-dimensional data, got {}".format(
-                    ndim, out[0].shape[0]
-                )
+                f"Expected at least {ndim}-dimensional data, got {out[0].shape[0]}"
             )
     return out

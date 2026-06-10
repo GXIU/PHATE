@@ -1,9 +1,9 @@
-from __future__ import absolute_import
+
+import phate.cluster
+import phate.mds
+import phate.plot
+import phate.tree
+import phate.vne
 
 from .phate import PHATE
-import phate.tree
-import phate.mds
-import phate.vne
-import phate.plot
-import phate.cluster
 from .version import __version__

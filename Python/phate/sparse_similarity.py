@@ -10,11 +10,11 @@ the sparse result. For N=20000, batch_size=256, float64: ~40 MB peak.
 """
 
 import numpy as np
-from scipy.sparse import csr_matrix, coo_matrix, issparse
+import tasklogger
+from scipy import sparse
+from scipy.sparse import coo_matrix, issparse
 from scipy.sparse.csgraph import connected_components
 from scipy.spatial.distance import cdist
-from scipy import sparse
-import tasklogger
 
 try:
     import torch

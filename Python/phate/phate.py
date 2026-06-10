@@ -4,20 +4,19 @@ Potential of Heat-diffusion for Affinity-based Trajectory Embedding (PHATE)
 
 # author: Daniel Burkhardt <daniel.burkhardt@yale.edu>
 # (C) 2017 Krishnaswamy Lab GPLv2
-from __future__ import print_function, division, absolute_import
 
-import numpy as np
-import graphtools
-from sklearn.base import BaseEstimator
-from sklearn.exceptions import NotFittedError
-from scipy import sparse
 import warnings
+
+import graphtools
+import matplotlib.pyplot as plt
+import numpy as np
 import tasklogger
 from packaging import version
+from scipy import sparse
+from sklearn.base import BaseEstimator
+from sklearn.exceptions import NotFittedError
 
-import matplotlib.pyplot as plt
-
-from . import utils, vne, mds, sparse_similarity
+from . import mds, sparse_similarity, utils, vne
 
 try:
     import anndata
@@ -863,7 +862,7 @@ class PHATE(BaseEstimator):
                 _logger.log_info("Using precomputed graph and diffusion operator...")
             except ValueError as e:
                 # something changed that should have invalidated the graph
-                _logger.log_debug("Reset graph due to {}".format(str(e)))
+                _logger.log_debug(f"Reset graph due to {str(e)}")
                 self._reset_graph()
 
     def fit(self, X):
@@ -887,15 +886,11 @@ class PHATE(BaseEstimator):
 
         if precomputed is None:
             _logger.log_info(
-                "Running PHATE on {} observations and {} variables.".format(
-                    X.shape[0], X.shape[1]
-                )
+                f"Running PHATE on {X.shape[0]} observations and {X.shape[1]} variables."
             )
         else:
             _logger.log_info(
-                "Running PHATE on precomputed {} matrix with {} observations.".format(
-                    precomputed, X.shape[0]
-                )
+                f"Running PHATE on precomputed {precomputed} matrix with {X.shape[0]} observations."
             )
 
         if self.n_landmark is None or X.shape[0] <= self.n_landmark:
@@ -1070,7 +1065,8 @@ class PHATE(BaseEstimator):
                 t_max=t_max, plot_optimal_t=plot_optimal_t, ax=ax
             )
             if self.embedding is None:
-                with _logger.log_task("{} MDS".format(self.mds)):
+                with _logger.log_task(f"{self.mds} MDS"):
+                    pot_is_pairwise = sparse.issparse(self._diff_potential)
                     self.embedding = mds.embed_MDS(
                         diff_potential,
                         ndim=self.n_components,
@@ -1080,6 +1076,7 @@ class PHATE(BaseEstimator):
                         n_jobs=self.n_jobs,
                         seed=self.random_state,
                         verbose=max(self.verbose - 1, 0),
+                        is_pairwise=pot_is_pairwise,
                     )
             if isinstance(self.graph, graphtools.graphs.LandmarkGraph):
                 _logger.log_debug("Extending to original data...")
@@ -1150,25 +1147,41 @@ class PHATE(BaseEstimator):
                 # diffused diffusion operator
                 diff_op = self.diff_op
                 if sparse.issparse(diff_op):
-                    # Sparse matrix power
+                    # Sparse matrix power with stepwise density monitoring
+                    t_int = int(t)
+                    n_sq = diff_op.shape[0] * diff_op.shape[1]
                     _logger.log_debug(
-                        f"Computing sparse diffusion operator to power t={t} "
+                        f"Computing sparse diffusion operator to power t={t_int} "
                         f"(nnz={diff_op.nnz})..."
                     )
-                    diff_op_t = diff_op ** int(t)
-                    # If result is very dense, convert to dense for efficiency
-                    density = diff_op_t.nnz / (diff_op_t.shape[0] * diff_op_t.shape[1])
-                    if density > 0.3:
-                        _logger.log_debug(
-                            f"Diffusion operator {density:.1%} dense after "
-                            f"powering; converting to dense array."
-                        )
-                        diff_op_t = diff_op_t.toarray()
-                    else:
-                        _logger.log_debug(
-                            f"Diffusion operator {density:.1%} dense after powering; "
-                            f"keeping sparse."
-                        )
+                    diff_op_t = diff_op
+                    for _step in range(t_int):
+                        diff_op_t = diff_op_t @ diff_op
+                        density = diff_op_t.nnz / n_sq
+                        if density > 0.3 and _step < t_int - 1:
+                            remaining = t_int - _step - 1
+                            _logger.log_debug(
+                                f"Crossed 30% density threshold at step {_step + 1}/{t_int} "
+                                f"({density:.1%}); switching to dense for remaining "
+                                f"{remaining} step(s)."
+                            )
+                            diff_op_t = np.linalg.matrix_power(
+                                diff_op_t.toarray(), remaining
+                            )
+                            break
+                    if sparse.issparse(diff_op_t):
+                        density = diff_op_t.nnz / n_sq
+                        if density > 0.3:
+                            _logger.log_debug(
+                                f"Diffusion operator {density:.1%} dense after "
+                                f"powering; converting to dense array."
+                            )
+                            diff_op_t = diff_op_t.toarray()
+                        else:
+                            _logger.log_debug(
+                                f"Diffusion operator {density:.1%} dense after powering; "
+                                f"keeping sparse."
+                            )
                 else:
                     diff_op_t = np.linalg.matrix_power(diff_op, t)
                 if self.gamma == 1:
@@ -1246,7 +1259,7 @@ class PHATE(BaseEstimator):
         with _logger.log_task("optimal t"):
             t, h = self._von_neumann_entropy(t_max=t_max)
             t_opt = vne.find_knee_point(y=h, x=t)
-            _logger.log_info("Automatically selected t = {}".format(t_opt))
+            _logger.log_info(f"Automatically selected t = {t_opt}")
 
         if plot:
             if ax is None:
@@ -1258,7 +1271,7 @@ class PHATE(BaseEstimator):
             ax.scatter(t_opt, h[t == t_opt], marker="*", c="k", s=50)
             ax.set_xlabel("t")
             ax.set_ylabel("Von Neumann Entropy")
-            ax.set_title("Optimal t = {}".format(t_opt))
+            ax.set_title(f"Optimal t = {t_opt}")
             if show:
                 plt.show()
 

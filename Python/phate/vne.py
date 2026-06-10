@@ -1,12 +1,10 @@
 # author: Daniel Burkhardt <daniel.burkhardt@yale.edu>
 # (C) 2017 Krishnaswamy Lab GPLv2
 
-from __future__ import print_function, division
 import numpy as np
-from scipy.linalg import svd
 from scipy import sparse
+from scipy.linalg import svd
 from scipy.sparse.linalg import eigsh
-import warnings
 
 # Von Neumann Entropy
 

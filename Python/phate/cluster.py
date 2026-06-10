@@ -1,6 +1,8 @@
-from sklearn import cluster, exceptions, metrics
 import warnings
+
 import numpy as np
+from sklearn import cluster, exceptions, metrics
+
 from .phate import PHATE
 
 
@@ -60,7 +62,7 @@ def kmeans(
         n_clusters = k
     if not isinstance(phate_op, PHATE):
         raise TypeError(
-            "Expected phate_op to be of type PHATE. Got {}".format(phate_op)
+            f"Expected phate_op to be of type PHATE. Got {phate_op}"
         )
     if phate_op.graph is not None:
         if n_clusters == "auto":

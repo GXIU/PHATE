@@ -3,7 +3,6 @@
 
 """Simple SGD-MDS - Just random sampling, no neighbor structure"""
 
-from __future__ import print_function, division
 import numpy as np
 import tasklogger
 
@@ -19,6 +18,7 @@ def sgd_mds(
     random_state=None,
     verbose=0,
     pairs_per_iter=None,
+    sparse=False,
 ):
     """Fast SGD-MDS using random pair sampling
 
@@ -31,7 +31,7 @@ def sgd_mds(
     Parameters
     ----------
     D : array-like, shape (n_samples, n_samples)
-        Distance matrix
+        Distance matrix. May be scipy.sparse.csr_matrix when sparse=True.
     n_components : int, default=2
         Number of dimensions for the output embedding
     learning_rate : float, default=0.001
@@ -47,6 +47,9 @@ def sgd_mds(
     pairs_per_iter : int, optional
         Number of pairs to sample per iteration.
         If None, uses n * log(n) pairs per iteration.
+    sparse : bool, default=False
+        If True, D is a sparse CSR matrix and pairs are sampled from
+        its non-zero entries only.
 
     Returns
     -------
@@ -62,12 +65,22 @@ def sgd_mds(
 
     n_samples = D.shape[0]
 
+    # Handle sparse input
+    _is_sparse = sparse and hasattr(D, 'nnz')
+    if _is_sparse:
+        # Pre-compute non-zero indices for pair sampling
+        _nnz_rows, _nnz_cols = D.nonzero()
+        _nnz_data = D.data
+        _n_edges = len(_nnz_data)
+        D_max = np.max(_nnz_data) if _n_edges > 0 else 1.0
+    else:
+        D_max = np.max(D)
+
     # Normalize distances for numerical stability
-    D_max = np.max(D)
     if D_max > 0:
         D_norm = D / D_max
     else:
-        D_norm = D.copy()
+        D_norm = D.copy() if not _is_sparse else D / 1.0
 
     # Initialize
     if init is None:
@@ -122,21 +135,36 @@ def sgd_mds(
         # Exponential decay schedule (s_gd2 style)
         lr = eta_max * np.exp(-lambd * iteration)
 
-        # Randomly sample pairs (without replacement for efficiency)
-        # Sample from upper triangle to avoid double-counting
-        i_sample = rng.randint(0, n_samples, pairs_per_iter)
-        j_sample = rng.randint(0, n_samples, pairs_per_iter)
+        # Randomly sample pairs
+        if _is_sparse:
+            # Sample from non-zero entries only (known relationships)
+            edge_idx = rng.randint(0, _n_edges, pairs_per_iter)
+            i_sample = _nnz_rows[edge_idx]
+            j_sample = _nnz_cols[edge_idx]
+            target_dists = _nnz_data[edge_idx] / D_max
+            # Filter out diagonal (i == j)
+            valid = i_sample != j_sample
+            i_sample = i_sample[valid]
+            j_sample = j_sample[valid]
+            target_dists = target_dists[valid]
+        else:
+            # Sample uniformly from all pairs
+            i_sample = rng.randint(0, n_samples, pairs_per_iter)
+            j_sample = rng.randint(0, n_samples, pairs_per_iter)
 
-        # Filter out diagonal (i == j)
-        valid = i_sample != j_sample
-        i_sample = i_sample[valid]
-        j_sample = j_sample[valid]
+            # Filter out diagonal (i == j)
+            valid = i_sample != j_sample
+            i_sample = i_sample[valid]
+            j_sample = j_sample[valid]
+
+            if len(i_sample) == 0:
+                continue
+
+            # Get target distances
+            target_dists = D_norm[i_sample, j_sample]
 
         if len(i_sample) == 0:
             continue
-
-        # Get target distances
-        target_dists = D_norm[i_sample, j_sample]
 
         # Compute current distances
         diff = Y[i_sample] - Y[j_sample]
@@ -211,6 +239,7 @@ def sgd_mds_metric(
     init=None,
     random_state=None,
     verbose=0,
+    sparse=False,
 ):
     """Auto-tuned SGD-MDS with optimal parameters for different data sizes
 
@@ -220,7 +249,7 @@ def sgd_mds_metric(
     Parameters
     ----------
     D : array-like, shape (n_samples, n_samples)
-        Distance matrix
+        Distance matrix. May be scipy.sparse.csr_matrix when sparse=True.
     n_components : int, default=2
         Number of dimensions for the output embedding
     init : array-like, shape (n_samples, n_components), optional
@@ -229,6 +258,8 @@ def sgd_mds_metric(
         Random state for reproducibility
     verbose : int, default=0
         Verbosity level (0=silent, 1=progress, 2=debug)
+    sparse : bool, default=False
+        If True, D is a sparse CSR and pairs are sampled from non-zero entries.
 
     Returns
     -------
@@ -248,6 +279,10 @@ def sgd_mds_metric(
         n_iter = 800
         pairs_per_iter = int(n_samples * np.log(n_samples) * 2)
 
+    # For sparse: cap pairs_per_iter to available non-zero entries
+    if sparse and hasattr(D, 'nnz'):
+        pairs_per_iter = min(pairs_per_iter, D.nnz)
+
     return sgd_mds(
         D=D,
         n_components=n_components,
@@ -257,4 +292,5 @@ def sgd_mds_metric(
         random_state=random_state,
         verbose=verbose,
         pairs_per_iter=pairs_per_iter,
+        sparse=sparse,
     )

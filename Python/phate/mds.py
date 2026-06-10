@@ -1,16 +1,15 @@
 # author: Daniel Burkhardt <daniel.burkhardt@yale.edu>
 # (C) 2017 Krishnaswamy Lab GPLv2
 
-from __future__ import print_function, division
+import numpy as np
+import scipy.spatial
+import tasklogger
+from deprecated import deprecated
+from scipy import sparse
+from scipy.spatial.distance import pdist, squareform
 from sklearn import manifold
 from sklearn.decomposition import PCA
-from scipy.spatial.distance import pdist, squareform
-import scipy.spatial
-from scipy import sparse
-import numpy as np
-from deprecated import deprecated
 
-import tasklogger
 from . import sgd_mds as sgd_mds_module
 
 _logger = tasklogger.get_tasklogger("graphtools")
@@ -41,7 +40,7 @@ def classic(D, n_components=2, random_state=None):
     Y : array-like, embedded data [n_sample, ndim]
     """
     _logger.log_debug(
-        "Performing classic MDS on {} of shape {}...".format(type(D).__name__, D.shape)
+        f"Performing classic MDS on {type(D).__name__} of shape {D.shape}..."
     )
     D = D**2
     D = D - D.mean(axis=0)[None, :]
@@ -129,7 +128,7 @@ def smacof(
         embedded data
     """
     _logger.log_debug(
-        "Performing non-metric MDS on " "{} of shape {}...".format(type(D), D.shape)
+        "Performing non-metric MDS on " f"{type(D)} of shape {D.shape}..."
     )
     # Metric MDS from sklearn
     Y, _ = manifold.smacof(
@@ -156,6 +155,7 @@ def embed_MDS(
     n_jobs=1,
     seed=None,
     verbose=0,
+    is_pairwise=False,
 ):
     """Performs classic, metric, and non-metric MDS
 
@@ -195,6 +195,10 @@ def embed_MDS(
         If an integer is given, it fixes the seed
         Defaults to the global numpy random number generator
 
+    is_pairwise : bool, optional, default: False
+        If True, X is treated as a precomputed pairwise dissimilarity matrix
+        (shape [n_samples, n_samples]). Distance computation is skipped.
+
     Returns
     -------
     Y : ndarray [n_samples, n_dim]
@@ -205,63 +209,75 @@ def embed_MDS(
         raise ValueError(
             "Allowable 'how' values for MDS: 'classic', "
             "'metric', or 'nonmetric'. "
-            "'{}' was passed.".format(how)
+            f"'{how}' was passed."
         )
     if solver not in ["sgd", "smacof"]:
         raise ValueError(
             "Allowable 'solver' values for MDS: 'sgd' or "
             "'smacof'. "
-            "'{}' was passed.".format(solver)
+            f"'{solver}' was passed."
         )
 
     # MDS embeddings, each gives a different output.
-    # Handle sparse input: densify for pdist/euclidean_distances compatibility
-    if sparse.issparse(X):
-        X = X.toarray()
-
-    # For large n (>1000), use optimized euclidean_distances from sklearn
-    # which is much faster than scipy's pdist + squareform
-    if distance_metric == "euclidean" and X.shape[0] > 1000:
-        from sklearn.metrics.pairwise import euclidean_distances
-
-        X_dist = euclidean_distances(X, X)
+    if is_pairwise:
+        # X is already a pairwise dissimilarity matrix; skip distance computation
+        if sparse.issparse(X):
+            X_dist = X  # keep sparse for SGD-MDS, densify only if needed
+        else:
+            X_dist = np.asarray(X)
     else:
-        X_dist = squareform(pdist(X, distance_metric))
+        # Handle sparse input: densify for pdist/euclidean_distances compatibility
+        if sparse.issparse(X):
+            X = X.toarray()
+
+        # For large n (>1000), use optimized euclidean_distances from sklearn
+        # which is much faster than scipy's pdist + squareform
+        if distance_metric == "euclidean" and X.shape[0] > 1000:
+            from sklearn.metrics.pairwise import euclidean_distances
+
+            X_dist = euclidean_distances(X, X)
+        else:
+            X_dist = squareform(pdist(X, distance_metric))
 
     # Check for degenerate distance matrix before calling classic MDS
     # This happens with extreme hyperparameters (e.g., KNN close to dataset size)
     # causing complete diffusion homogeneity
-    if X_dist.std() < 1e-10 or len(np.unique(X_dist)) <= 1:
+    if sparse.issparse(X_dist):
+        _dist_check = X_dist.data
+    else:
+        _dist_check = X_dist
+    if _dist_check.std() < 1e-10 or len(np.unique(_dist_check)) <= 1:
         import warnings
         warnings.warn(
-            f"Degenerate distance matrix detected (std={X_dist.std():.2e}, "
-            f"unique_values={len(np.unique(X_dist))}). "
+            f"Degenerate distance matrix detected (std={_dist_check.std():.2e}, "
+            f"unique_values={len(np.unique(_dist_check))}). "
             "This typically occurs when hyperparameters cause complete diffusion homogeneity "
             "(e.g., KNN close to dataset size). "
             "Returning zero embedding.",
             RuntimeWarning
         )
-        # Return all zeros to indicate complete collapse
         return np.zeros((X_dist.shape[0], ndim))
 
-    # initialize all by CMDS
-    Y_classic = classic(X_dist, n_components=ndim, random_state=seed)
+    # Classic MDS requires dense: densify if needed
+    X_dense = X_dist.toarray() if sparse.issparse(X_dist) else X_dist
+    Y_classic = classic(X_dense, n_components=ndim, random_state=seed)
     if how == "classic":
         return Y_classic
 
     # metric MDS using SGD or SMACOF
     if solver == "sgd":
-        # Use fast SGD with random pair sampling
+        _is_sparse = sparse.issparse(X_dist)
         Y = sgd_mds_module.sgd_mds_metric(
             X_dist,
             n_components=ndim,
             random_state=seed,
             init=Y_classic,
             verbose=verbose,
+            sparse=_is_sparse,
         )
     elif solver == "smacof":
         Y = smacof(
-            X_dist, n_components=ndim, random_state=seed, init=Y_classic, metric=True
+            X_dense, n_components=ndim, random_state=seed, init=Y_classic, metric=True
         )
     else:
         raise RuntimeError
