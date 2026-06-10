@@ -17,7 +17,7 @@ from packaging import version
 
 import matplotlib.pyplot as plt
 
-from . import utils, vne, mds
+from . import utils, vne, mds, sparse_similarity
 
 try:
     import anndata
@@ -201,6 +201,11 @@ class PHATE(BaseEstimator):
         n_jobs=1,
         random_state=None,
         random_landmarking=False,
+        sparse_k=None,
+        sparse_metric="euclidean",
+        sparse_backend="scipy",
+        sparse_device="cpu",
+        sparse_batch_size=256,
         verbose=1,
         **kwargs,
     ):
@@ -249,10 +254,16 @@ class PHATE(BaseEstimator):
             random_landmarking = False
 
         self.random_landmarking = random_landmarking
+        self.sparse_k = sparse_k
+        self.sparse_metric = sparse_metric
+        self.sparse_backend = sparse_backend
+        self.sparse_device = sparse_device
+        self.sparse_batch_size = sparse_batch_size
         self.kwargs = kwargs
 
         self.graph = None
         self._diff_potential = None
+        self._sparse_diff_op = None
         self.embedding = None
         self.X = None
         self.optimal_t = None
@@ -313,13 +324,13 @@ class PHATE(BaseEstimator):
         """diff_op :  array-like, shape=[n_samples, n_samples] or [n_landmark, n_landmark]
         The diffusion operator built from the graph
         """
+        if self._sparse_diff_op is not None:
+            return self._sparse_diff_op
         if self.graph is not None:
             if isinstance(self.graph, graphtools.graphs.LandmarkGraph):
                 diff_op = self.graph.landmark_op
             else:
                 diff_op = self.graph.diff_op
-            if sparse.issparse(diff_op):
-                diff_op = diff_op.toarray()
             return diff_op
         else:
             raise NotFittedError(
@@ -442,6 +453,7 @@ class PHATE(BaseEstimator):
 
     def _reset_graph(self):
         self.graph = None
+        self._sparse_diff_op = None
         self._reset_potential()
 
     def _reset_potential(self):
@@ -640,6 +652,17 @@ class PHATE(BaseEstimator):
             self.decay = params["decay"]
             reset_kernel = True
             del params["decay"]
+        if "sparse_k" in params and params["sparse_k"] != self.sparse_k:
+            self.sparse_k = params["sparse_k"]
+            reset_kernel = True
+            del params["sparse_k"]
+        if "sparse_metric" in params and params["sparse_metric"] != self.sparse_metric:
+            self.sparse_metric = params["sparse_metric"]
+            reset_kernel = True
+            del params["sparse_metric"]
+        if "sparse_batch_size" in params:
+            self.sparse_batch_size = params["sparse_batch_size"]
+            del params["sparse_batch_size"]
         if "n_pca" in params:
             if self.X is not None and params["n_pca"] >= np.min(self.X.shape):
                 params["n_pca"] = None
@@ -888,45 +911,100 @@ class PHATE(BaseEstimator):
         self.X = X
 
         if self.graph is None:
-            with _logger.log_task("graph and diffusion operator"):
-                # Prepare graph params
-                graph_params = {
-                    "n_pca": n_pca,
-                    "n_landmark": n_landmark,
-                    "distance": self.knn_dist,
-                    "precomputed": precomputed,
-                    "knn": self.knn,
-                    "knn_max": self.knn_max,
-                    "decay": self.decay,
-                    "thresh": 1e-4,
-                    "n_jobs": self.n_jobs,
-                    "verbose": self.verbose,
-                    "random_state": self.random_state,
-                }
-
-                # Only add random_landmarking if graphtools supports it
-                if _graphtools_version_is_at_least_2_1():
-                    graph_params["random_landmarking"] = self.random_landmarking
-
-                # Merge with any additional kwargs
-                graph_params.update(self.kwargs)
-
-                self.graph = graphtools.Graph(X, **graph_params)
-
-                # Check for graph connectivity (requires graphtools >= 2.0.0)
-                if _graphtools_version_is_at_least_2_1():
-                    if not self.graph.is_connected:
+            # Sparse path: compute similarity directly without graphtools
+            if self.sparse_k is not None and precomputed is None:
+                with _logger.log_task("sparse similarity and diffusion operator"):
+                    _logger.log_info(
+                        f"Using sparse path with k={self.sparse_k}, "
+                        f"metric='{self.sparse_metric}', "
+                        f"backend='{self.sparse_backend}'"
+                    )
+                    if self.sparse_backend == "torch":
+                        S = sparse_similarity.compute_sparse_similarity_torch(
+                            X,
+                            k=self.sparse_k,
+                            metric=self.sparse_metric,
+                            decay=self.decay,
+                            batch_size=self.sparse_batch_size,
+                            device=self.sparse_device,
+                            verbose=self.verbose,
+                        )
+                    else:
+                        S = sparse_similarity.compute_sparse_similarity(
+                            X,
+                            k=self.sparse_k,
+                            metric=self.sparse_metric,
+                            decay=self.decay,
+                            batch_size=self.sparse_batch_size,
+                            verbose=self.verbose,
+                        )
+                    self._sparse_diff_op = (
+                        sparse_similarity.compute_sparse_diffusion_operator(S)
+                    )
+                    # Connectivity check
+                    n_comp, _ = sparse_similarity.check_connectivity(
+                        self._sparse_diff_op
+                    )
+                    if n_comp > 1:
                         warnings.warn(
-                            f"Graph is disconnected with {self.graph.n_connected_components} "
-                            f"connected components. This may indicate that your knn parameter "
-                            f"(currently {self.knn}) is too small, or that your data contains "
-                            f"distinct clusters. PHATE may not accurately represent relationships "
-                            f"between disconnected components.",
+                            f"Graph is disconnected with {n_comp} "
+                            f"connected components. This may indicate "
+                            f"that sparse_k (currently {self.sparse_k}) "
+                            f"is too small. Consider increasing sparse_k.",
                             RuntimeWarning,
                         )
+                    _logger.log_info(
+                        f"Diffusion operator: "
+                        f"{self._sparse_diff_op.nnz} non-zeros "
+                        f"({100 * self._sparse_diff_op.nnz / (X.shape[0] * X.shape[0]):.3f}% dense)"
+                    )
+            else:
+                with _logger.log_task("graph and diffusion operator"):
+                    # Prepare graph params
+                    graph_params = {
+                        "n_pca": n_pca,
+                        "n_landmark": n_landmark,
+                        "distance": self.knn_dist,
+                        "precomputed": precomputed,
+                        "knn": self.knn,
+                        "knn_max": self.knn_max,
+                        "decay": self.decay,
+                        "thresh": 1e-4,
+                        "n_jobs": self.n_jobs,
+                        "verbose": self.verbose,
+                        "random_state": self.random_state,
+                    }
+
+                    # Only add random_landmarking if graphtools supports it
+                    if _graphtools_version_is_at_least_2_1():
+                        graph_params["random_landmarking"] = (
+                            self.random_landmarking
+                        )
+
+                    # Merge with any additional kwargs
+                    graph_params.update(self.kwargs)
+
+                    self.graph = graphtools.Graph(X, **graph_params)
+
+                    # Check for graph connectivity
+                    if _graphtools_version_is_at_least_2_1():
+                        if not self.graph.is_connected:
+                            warnings.warn(
+                                f"Graph is disconnected with "
+                                f"{self.graph.n_connected_components} "
+                                f"connected components. This may indicate "
+                                f"that your knn parameter "
+                                f"(currently {self.knn}) is too small, "
+                                f"or that your data contains "
+                                f"distinct clusters. PHATE may not "
+                                f"accurately represent relationships "
+                                f"between disconnected components.",
+                                RuntimeWarning,
+                            )
 
         # landmark op doesn't build unless forced
-        self.diff_op
+        if self._sparse_diff_op is not None or self.graph is not None:
+            self.diff_op
         return self
 
     def transform(self, X=None, t_max=100, plot_optimal_t=False, ax=None):
@@ -959,7 +1037,7 @@ class PHATE(BaseEstimator):
         embedding : array, shape=[n_samples, n_dimensions]
         The cells embedded in a lower dimensional space using PHATE
         """
-        if self.graph is None:
+        if self.graph is None and self._sparse_diff_op is None:
             raise NotFittedError(
                 "This PHATE instance is not fitted yet. Call "
                 "'fit' with appropriate arguments before "
@@ -974,7 +1052,8 @@ class PHATE(BaseEstimator):
                 RuntimeWarning,
             )
             if (
-                isinstance(self.graph, graphtools.graphs.TraditionalGraph)
+                self.graph is not None
+                and isinstance(self.graph, graphtools.graphs.TraditionalGraph)
                 and self.graph.precomputed is not None
             ):
                 raise ValueError(
@@ -1069,16 +1148,45 @@ class PHATE(BaseEstimator):
                 t = self.t
             with _logger.log_task("diffusion potential"):
                 # diffused diffusion operator
-                diff_op_t = np.linalg.matrix_power(self.diff_op, t)
+                diff_op = self.diff_op
+                if sparse.issparse(diff_op):
+                    # Sparse matrix power
+                    _logger.log_debug(
+                        f"Computing sparse diffusion operator to power t={t} "
+                        f"(nnz={diff_op.nnz})..."
+                    )
+                    diff_op_t = diff_op ** int(t)
+                    # If result is very dense, convert to dense for efficiency
+                    density = diff_op_t.nnz / (diff_op_t.shape[0] * diff_op_t.shape[1])
+                    if density > 0.3:
+                        _logger.log_debug(
+                            f"Diffusion operator {density:.1%} dense after "
+                            f"powering; converting to dense array."
+                        )
+                        diff_op_t = diff_op_t.toarray()
+                    else:
+                        _logger.log_debug(
+                            f"Diffusion operator {density:.1%} dense after powering; "
+                            f"keeping sparse."
+                        )
+                else:
+                    diff_op_t = np.linalg.matrix_power(diff_op, t)
                 if self.gamma == 1:
-                    # handling small values
-                    diff_op_t = diff_op_t + 1e-7
-                    self._diff_potential = -1 * np.log(diff_op_t)
+                    if sparse.issparse(diff_op_t):
+                        diff_op_t.data = -np.log(diff_op_t.data + 1e-7)
+                        self._diff_potential = diff_op_t
+                    else:
+                        diff_op_t = diff_op_t + 1e-7
+                        self._diff_potential = -1 * np.log(diff_op_t)
                 elif self.gamma == -1:
                     self._diff_potential = diff_op_t
                 else:
                     c = (1 - self.gamma) / 2
-                    self._diff_potential = ((diff_op_t) ** c) / c
+                    if sparse.issparse(diff_op_t):
+                        diff_op_t.data = (diff_op_t.data ** c) / c
+                        self._diff_potential = diff_op_t
+                    else:
+                        self._diff_potential = ((diff_op_t) ** c) / c
         elif plot_optimal_t:
             self._find_optimal_t(t_max=t_max, plot=plot_optimal_t, ax=ax)
 
@@ -1105,7 +1213,12 @@ class PHATE(BaseEstimator):
             The entropy of the diffusion affinities for each value of `t`
         """
         t = np.arange(t_max)
-        return t, vne.compute_von_neumann_entropy(self.diff_op, t_max=t_max)
+        diff_op = self.diff_op
+        if sparse.issparse(diff_op):
+            return t, vne.compute_von_neumann_entropy_sparse(
+                diff_op, t_max=t_max
+            )
+        return t, vne.compute_von_neumann_entropy(diff_op, t_max=t_max)
 
     def _find_optimal_t(self, t_max=100, plot=False, ax=None):
         """Find the optimal value of t

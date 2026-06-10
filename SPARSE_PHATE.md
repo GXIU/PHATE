@@ -73,6 +73,8 @@ component. Each iteration builds a sparse similarity matrix and runs
 
 MacBook Pro M-series, 24 GB RAM. Synthetic tree data (100-dim features).
 
+### Full pipeline (including MDS)
+
 | N | Mode | Time | Memory | Sparsity | Quality |
 |---|------|------|--------|----------|---------|
 | 500 | original | 1.25s | 64 MB | — | — |
@@ -84,8 +86,30 @@ MacBook Pro M-series, 24 GB RAM. Synthetic tree data (100-dim features).
 | 3000 | **sparse** | 23.9s | 408 MB | 0.47% | — |
 | 5000 | **sparse** | 114.8s | 723 MB | 0.28% | — |
 
-Quality: Procrustes normalized disparity vs original. Lower is better
-(0 = identical). All ≤ 0.003 — near-identical embeddings.
+### PyTorch acceleration — similarity computation only (euclidean metric)
+
+| N | scipy (cdist) | torch cpu | torch mps | Speedup (scipy→torch/cpu) |
+|---|---------------|-----------|-----------|---------------------------|
+| 500 | 0.01s | 0.00s | 0.61s | — |
+| 1,000 | 0.03s | 0.00s | 0.21s | — |
+| 2,000 | 0.10s | 0.01s | 0.20s | 10× |
+| 3,000 | 0.20s | 0.01s | 0.16s | 20× |
+| 5,000 | 0.56s | 0.03s | 0.10s | 19× |
+| 10,000 | 2.27s | 0.11s | — | 21× |
+| **20,000** | **8.82s** | **0.37s** | — | **24×** |
+
+Torch/cpu is consistently ~20× faster than scipy for the similarity
+computation. The speedup comes from `torch.topk` being fully vectorized
+across the batch dimension, while scipy uses a per-row Python loop.
+Torch/mps has GPU transfer overhead at small N but becomes competitive
+above N=3000.
+
+Correlation metric via torch matrix multiplication (`batch_norm @ X_norm.T`)
+is also fast — 0.68s at N=20,000, vs 8.82s for scipy cdist euclidean (13×
+faster despite being a more complex metric).
+
+All backends produce identical embeddings (Procrustes disparity = 0.0,
+correlation = 1.0) — torch is a drop-in replacement with no quality loss.
 
 Minimal k for connectivity (N=500): k=3, found in 0.06s.
 At k=2: 75 disconnected components.
@@ -99,6 +123,9 @@ import phate
 phate_op = phate.PHATE(
     sparse_k=100,                # top-k entries per sample
     sparse_metric="correlation", # "euclidean", "cosine", "correlation"
+    sparse_backend="torch",      # "scipy" (default) or "torch"
+    sparse_device="cpu",         # "cpu", "cuda", or "mps"
+    sparse_batch_size=256,       # rows per batch (tune for GPU memory)
     t=20,
     verbose=False,
     random_state=42,

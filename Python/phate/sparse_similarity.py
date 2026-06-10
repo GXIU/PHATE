@@ -16,6 +16,13 @@ from scipy.spatial.distance import cdist
 from scipy import sparse
 import tasklogger
 
+try:
+    import torch
+
+    _has_torch = True
+except ImportError:
+    _has_torch = False
+
 _logger = tasklogger.get_tasklogger("graphtools")
 
 
@@ -123,6 +130,126 @@ def compute_sparse_similarity(
     S = S_coo.tocsr()
 
     # Symmetrize: average with transpose for undirected graph
+    S = (S + S.T) * 0.5
+
+    _logger.log_info(
+        f"Result: {S.nnz} non-zeros ({100 * S.nnz / (n_samples * n_samples):.3f}% dense)"
+    )
+
+    return S
+
+
+def compute_sparse_similarity_torch(
+    X,
+    k=10,
+    metric="euclidean",
+    decay=40,
+    batch_size=256,
+    device="cpu",
+    verbose=1,
+):
+    """Torch-accelerated sparse similarity computation.
+
+    Uses PyTorch for GPU/optimized-CPU pairwise distance computation
+    and top-k selection. Falls back to scipy if torch is unavailable.
+
+    For ``metric='correlation'``, uses matrix multiplication after
+    z-score normalization (much faster than ``cdist``).
+
+    Parameters
+    ----------
+    X : ndarray, shape=[n_samples, n_features]
+        Input data matrix.
+    k : int
+        Number of top entries to retain per row.
+    metric : str
+        ``'euclidean'``, ``'cosine'``, or ``'correlation'``.
+    decay : float or None
+        Alpha decay parameter for kernel.
+    batch_size : int
+        Rows per batch.
+    device : str
+        Torch device (``'cpu'``, ``'cuda'``, ``'mps'``).
+    verbose : int
+        Verbosity level.
+
+    Returns
+    -------
+    S : scipy.sparse.csr_matrix
+    """
+    if not _has_torch:
+        _logger.log_info("Torch not available; falling back to scipy.")
+        return compute_sparse_similarity(
+            X, k=k, metric=metric, decay=decay, batch_size=batch_size, verbose=verbose
+        )
+
+    n_samples = X.shape[0]
+    k = min(k, n_samples)
+    is_similarity = metric in {"cosine", "correlation"}
+
+    X_t = torch.from_numpy(X.astype(np.float32)).to(device)
+
+    kernel_str = f"exp(-d/{decay})" if decay else "raw"
+    _logger.log_info(
+        f"Computing sparse {k}-NN similarity (torch, {device}) on {n_samples} samples "
+        f"with metric='{metric}', kernel={kernel_str}, batch_size={batch_size}..."
+    )
+
+    all_rows = []
+    all_cols = []
+    all_vals = []
+
+    for batch_start in range(0, n_samples, batch_size):
+        batch_end = min(batch_start + batch_size, n_samples)
+        batch = X_t[batch_start:batch_end]
+
+        if metric == "correlation":
+            # Correlation via matrix multiplication: much faster than cdist
+            # z-score the batch and full data
+            b_centered = batch - batch.mean(dim=1, keepdim=True)
+            b_norm = b_centered / (b_centered.std(dim=1, keepdim=True) + 1e-10)
+            x_centered = X_t - X_t.mean(dim=1, keepdim=True)
+            x_norm = x_centered / (x_centered.std(dim=1, keepdim=True) + 1e-10)
+            # Correlation distance = 1 - correlation (matches scipy cdist)
+            pair = 1 - b_norm @ x_norm.T  # (batch_sz, n_samples)
+        elif metric == "cosine":
+            # Cosine distance = 1 - normalized dot product (matches scipy cdist)
+            b_norm = batch / (batch.norm(dim=1, keepdim=True) + 1e-10)
+            x_norm = X_t / (X_t.norm(dim=1, keepdim=True) + 1e-10)
+            pair = 1 - b_norm @ x_norm.T
+        else:
+            pair = torch.cdist(batch, X_t)  # (batch_sz, n_samples)
+
+        # Top-k selection
+        if is_similarity:
+            top_vals, top_idx = torch.topk(pair, k, dim=1, largest=True)
+        else:
+            top_vals, top_idx = torch.topk(pair, k, dim=1, largest=False)
+
+        top_vals = top_vals.cpu().numpy().astype(np.float64)
+        top_idx = top_idx.cpu().numpy()
+
+        # Apply kernel for distance metrics
+        if decay is not None and not is_similarity:
+            top_vals = np.exp(-top_vals / decay)
+
+        for i in range(top_idx.shape[0]):
+            global_i = batch_start + i
+            all_rows.extend([global_i] * k)
+            all_cols.extend(top_idx[i])
+            all_vals.extend(top_vals[i])
+
+        if verbose > 0 and (batch_end % (batch_size * 10) == 0 or batch_end == n_samples):
+            _logger.log_info(f"  Processed {batch_end}/{n_samples} samples...")
+
+    n_entries = len(all_rows)
+    _logger.log_info(f"Building sparse matrix with {n_entries} entries...")
+
+    S_coo = coo_matrix(
+        (all_vals, (all_rows, all_cols)),
+        shape=(n_samples, n_samples),
+    )
+    S = S_coo.tocsr()
     S = (S + S.T) * 0.5
 
     _logger.log_info(

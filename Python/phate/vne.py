@@ -4,6 +4,9 @@
 from __future__ import print_function, division
 import numpy as np
 from scipy.linalg import svd
+from scipy import sparse
+from scipy.sparse.linalg import eigsh
+import warnings
 
 # Von Neumann Entropy
 
@@ -45,6 +48,72 @@ def compute_von_neumann_entropy(data, t_max=100):
         entropy.append(-np.sum(prob * np.log(prob)))
         eigenvalues_t = eigenvalues_t * eigenvalues
     entropy = np.array(entropy)
+
+    return np.array(entropy)
+
+
+def compute_von_neumann_entropy_sparse(data, t_max=100, k_eigs=None):
+    """Compute Von Neumann Entropy of a sparse matrix.
+
+    Uses sparse eigendecomposition (``scipy.sparse.linalg.eigsh``) to
+    approximate eigenvalues. Since the diffusion operator spectrum decays
+    rapidly, the top ``k_eigs`` eigenvalues capture most of the information.
+
+    For non-symmetric sparse matrices (e.g., row-stochastic diffusion
+    operators), a symmetrized version is decomposed: P_sym = S, where
+    the eigenvalues of P and P_sym are identical.
+
+    Parameters
+    ----------
+    data : scipy.sparse.spmatrix
+        Sparse matrix (typically a diffusion operator).
+    t_max : int
+        Maximum power to evaluate.
+    k_eigs : int or None
+        Number of eigenvalues to compute. Defaults to min(100, n-2).
+
+    Returns
+    -------
+    entropy : ndarray, shape=[t_max]
+    """
+    n = data.shape[0]
+    if k_eigs is None:
+        k_eigs = min(100, n - 2)
+
+    if k_eigs >= n:
+        # Fall back to dense SVD for small matrices
+        return compute_von_neumann_entropy(
+            data.toarray() if sparse.issparse(data) else data, t_max=t_max
+        )
+
+    # For symmetric matrices, compute eigenvalues directly
+    if sparse.issparse(data):
+        # Check if matrix is approximately symmetric
+        if (data - data.T).nnz < data.nnz * 0.01:
+            eigenvalues, _ = eigsh(data, k=k_eigs, which="LM")
+        else:
+            # Non-symmetric: use the symmetrized version
+            # P = D^{-1} S has same eigenvalues as D^{-1/2} S D^{-1/2}
+            # Use S directly if data is P = D^{-1} S
+            # For general case, compute SVD of the underlying matrix
+            eigenvalues, _ = eigsh(
+                (data + data.T) * 0.5, k=k_eigs, which="LM"
+            )
+    else:
+        eigenvalues, _ = eigsh(data, k=k_eigs, which="LM")
+
+    # Sort descending
+    eigenvalues = np.sort(eigenvalues)[::-1]
+    # Ensure positivity
+    eigenvalues = np.abs(eigenvalues)
+
+    entropy = []
+    eigenvalues_t = np.copy(eigenvalues)
+    for _ in range(t_max):
+        prob = eigenvalues_t / np.sum(eigenvalues_t)
+        prob = prob + np.finfo(float).eps
+        entropy.append(-np.sum(prob * np.log(prob)))
+        eigenvalues_t = eigenvalues_t * eigenvalues
 
     return np.array(entropy)
 

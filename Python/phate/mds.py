@@ -6,6 +6,7 @@ from sklearn import manifold
 from sklearn.decomposition import PCA
 from scipy.spatial.distance import pdist, squareform
 import scipy.spatial
+from scipy import sparse
 import numpy as np
 from deprecated import deprecated
 
@@ -214,6 +215,10 @@ def embed_MDS(
         )
 
     # MDS embeddings, each gives a different output.
+    # Handle sparse input: densify for pdist/euclidean_distances compatibility
+    if sparse.issparse(X):
+        X = X.toarray()
+
     # For large n (>1000), use optimized euclidean_distances from sklearn
     # which is much faster than scipy's pdist + squareform
     if distance_metric == "euclidean" and X.shape[0] > 1000:

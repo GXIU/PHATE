@@ -10,6 +10,14 @@ PHATE
     :inherited-members:
     :show-inheritance:
 
+Sparse Similarity
+-----------------
+
+.. automodule:: phate.sparse_similarity
+    :members:
+    :undoc-members:
+    :show-inheritance:
+
 Clustering
 ----------
 
