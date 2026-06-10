@@ -1,7 +1,8 @@
 #!/usr/bin/env python
-"""Benchmark sparse vs original PHATE on increasing dataset sizes.
+"""Benchmark sparse similarity computation across backends, metrics, and sizes.
 
-Measures peak memory, runtime, and embedding quality (Procrustes distance).
+Reproducible: fixed seeds, deterministic configuration. Compares scipy vs
+torch backends for Euclidean and Correlation metrics at increasing N.
 """
 
 import time
@@ -14,20 +15,26 @@ import numpy as np
 import phate
 from phate import sparse_similarity
 
+# ── Configuration (change these to reproduce different scenarios) ──────────
 
-def peak_memory_mb():
-    """Return peak RSS in MB (macOS/Linux)."""
-    import resource
+SIZES = [500, 2000, 5000, 10000, 20000, 50000, 100000]
+SEEDS = [42, 123, 456, 789, 1024]
+K = 10
+DECAY = 40
+BATCH_SIZE = 256
+METRIC = "euclidean"
+N_FEATURES = 100
 
-    maxrss = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
-    # macOS returns bytes, Linux returns KB
-    if sys.platform == "darwin":
-        return maxrss / (1024 * 1024)
-    return maxrss / 1024
+BACKENDS = [
+    ("scipy", "euclidean", "cpu"),
+    ("torch", "euclidean", "cpu"),
+    ("torch", "correlation", "cpu"),
+]
+
+# ── Helpers ────────────────────────────────────────────────────────────────
 
 
-def gen_data(n_samples, n_features=100, seed=42):
-    """Generate synthetic tree data."""
+def gen_data(n_samples, n_features=N_FEATURES, seed=42):
     return phate.tree.gen_dla(
         n_dim=n_features,
         n_branch=max(1, n_samples // 100),
@@ -36,112 +43,68 @@ def gen_data(n_samples, n_features=100, seed=42):
     )
 
 
-def procrustes_distance(X, Y):
-    """Normalized Procrustes disparity: 0 = perfect match, 1 = worst."""
-    from scipy.spatial import procrustes
-
-    _, _, disparity = procrustes(X, Y)
-    # Normalize by the sum of variances
-    norm = np.var(X) * X.shape[0] * X.shape[1] + np.var(Y) * Y.shape[0] * Y.shape[1]
-    return disparity / (norm + 1e-10)
-
-
-def benchmark_phate(data, sparse_k=None, **kwargs):
-    """Run PHATE and return timing + memory + embedding."""
-    mem_before = peak_memory_mb()
-    t0 = time.time()
-
-    phate_op = phate.PHATE(
-        knn=5,
-        t=20,
-        sparse_k=sparse_k,
-        sparse_metric="euclidean",
-        sparse_batch_size=256,
-        verbose=False,
-        random_state=42,
-        **kwargs,
+def run_benchmark():
+    print(f"PHATE Sparse Similarity Benchmark")
+    print(f"k={K}, decay={DECAY}, batch_size={BATCH_SIZE}, features={N_FEATURES}")
+    print(f"Seeds: {SEEDS} ({len(SEEDS)} runs per config)")
+    print(f"Sizes: {SIZES}")
+    print()
+    print(
+        f"{'N':>8} {'Backend':>6} {'Metric':>12} "
+        f"{'Mean(s)':>10} {'Std(s)':>10} {'Min(s)':>10} {'Max(s)':>10} {'NNZ':>10} {'Density%':>10}"
     )
-    embedding = phate_op.fit_transform(data)
+    print("-" * 100)
 
-    elapsed = time.time() - t0
-    mem_after = peak_memory_mb()
-    mem_delta = mem_after - mem_before
+    for n in SIZES:
+        for backend, metric, device in BACKENDS:
+            # Skip scipy at large N (too slow)
+            if backend == "scipy" and n > 20000:
+                continue
 
-    return embedding, elapsed, mem_delta, phate_op
+            times = []
+            nnz = None
 
+            for seed in SEEDS:
+                data, _ = gen_data(n, seed=seed)
 
-def benchmark_sizes():
-    """Run benchmarks at increasing sizes."""
-    sizes = [500, 1000, 2000, 3000, 5000]
-    results = []
+                t0 = time.time()
+                if backend == "scipy":
+                    S = sparse_similarity.compute_sparse_similarity(
+                        data, k=K, metric=metric, decay=DECAY,
+                        batch_size=BATCH_SIZE, verbose=0,
+                    )
+                else:
+                    S = sparse_similarity.compute_sparse_similarity_torch(
+                        data, k=K, metric=metric, decay=DECAY,
+                        batch_size=BATCH_SIZE, device=device, verbose=0,
+                    )
+                times.append(time.time() - t0)
+                nnz = S.nnz
 
-    print("=" * 80)
-    print("PHATE Sparse Benchmark")
-    print("=" * 80)
-    print(f"{'N':>6} {'Mode':>12} {'Time(s)':>10} {'Mem(MB)':>10} {'Sparsity%':>12} {'Quality':>10}")
-    print("-" * 62)
-
-    for n in sizes:
-        data, clusters = gen_data(n, n_features=100)
-        print(f"\n--- N={n} ---")
-
-        # Original PHATE (skip for larger sizes if memory constrained)
-        if n <= 2000:
-            try:
-                emb_orig, t_orig, m_orig, _ = benchmark_phate(data, sparse_k=None)
-                print(
-                    f"{n:>6} {'original':>12} {t_orig:>10.2f} {m_orig:>10.1f} "
-                    f"{'N/A':>12} {'-':>10}"
-                )
-            except Exception as e:
-                print(f"{n:>6} {'original':>12} {'FAILED':>10}: {e}")
-                emb_orig, t_orig, m_orig = None, None, None
-        else:
-            emb_orig = None
-
-        # Sparse PHATE
-        try:
-            emb_sp, t_sp, m_sp, op_sp = benchmark_phate(data, sparse_k=10)
-            diff_op = op_sp.diff_op
-            if hasattr(diff_op, "nnz"):
-                sparsity = 100 * diff_op.nnz / (n * n)
-            else:
-                sparsity = 0.0
-
-            # Quality vs original (if available)
-            if emb_orig is not None:
-                # Align via Procrustes before comparing
-                quality = procrustes_distance(emb_orig, emb_sp)
-                quality_str = f"{quality:.4f}"
-            else:
-                quality_str = "N/A"
+            t_mean = np.mean(times)
+            t_std = np.std(times, ddof=1)
+            t_min = np.min(times)
+            t_max = np.max(times)
+            density = 100 * nnz / (n * n)
 
             print(
-                f"{n:>6} {'sparse':>12} {t_sp:>10.2f} {m_sp:>10.1f} "
-                f"{sparsity:>10.2f}% {quality_str:>10}"
+                f"{n:>8} {backend:>6} {metric:>12} "
+                f"{t_mean:>10.3f} {t_std:>10.3f} {t_min:>10.3f} {t_max:>10.3f} "
+                f"{nnz:>10} {density:>9.3f}%"
             )
-            results.append((n, t_sp, m_sp, sparsity, quality_str))
-        except Exception as e:
-            print(f"{n:>6} {'sparse':>12} {'FAILED':>10}: {e}")
-            import traceback
-
-            traceback.print_exc()
-
-    print("\n" + "=" * 80)
-    return results
+        print()
 
 
 def benchmark_minimal_k():
-    """Benchmark binary search for minimal k."""
-    print("\n" + "=" * 80)
+    """Binary search for minimal k achieving graph connectivity."""
+    print("=" * 80)
     print("Minimal k Connectivity Search")
     print("=" * 80)
 
     n = 500
-    data, _ = gen_data(n, n_features=100)
-    print(f"Dataset: N={n}, features=100")
+    data, _ = gen_data(n, seed=42)
+    print(f"Dataset: N={n}, features={N_FEATURES}")
 
-    # Time the minimal-k search
     t0 = time.time()
     k_opt, S = sparse_similarity.find_minimal_k(
         data, k_max=50, metric="euclidean", batch_size=256, verbose=1
@@ -149,23 +112,24 @@ def benchmark_minimal_k():
     elapsed = time.time() - t0
 
     n_comp, _ = sparse_similarity.check_connectivity(S)
-    print(f"\nMinimal k for connectivity: {k_opt}")
+    print(f"Minimal k for connectivity: {k_opt}")
     print(f"Components at k_opt: {n_comp}")
     print(f"Search time: {elapsed:.2f}s")
     print(f"Sparsity: {100 * S.nnz / (n * n):.3f}% ({S.nnz} non-zeros)")
 
-    # Test that k_opt-1 is disconnected
     if k_opt > 1:
+        t0 = time.time()
         S_prev = sparse_similarity.compute_sparse_similarity(
-            data, k=k_opt - 1, metric="euclidean", batch_size=256, verbose=0
+            data, k=k_opt - 1, metric="euclidean", decay=DECAY,
+            batch_size=BATCH_SIZE, verbose=0,
         )
         n_comp_prev, _ = sparse_similarity.check_connectivity(S_prev)
         print(f"Components at k_opt-1={k_opt - 1}: {n_comp_prev}")
+        print(f"Check time: {time.time() - t0:.2f}s")
 
     return k_opt
 
 
 if __name__ == "__main__":
-    print("PHATE Sparse Similarity Benchmarks\n")
-    benchmark_sizes()
+    run_benchmark()
     benchmark_minimal_k()
