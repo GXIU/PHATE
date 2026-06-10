@@ -1,0 +1,139 @@
+# =============================================================================
+# PHATE Sparse Benchmark — Example Configuration
+# =============================================================================
+# Usage:
+#   python benchmarks/benchmark_sparse_phate.py --config example_config.yml
+#   python benchmarks/benchmark_sparse_phate.py --config my.yml --sparse-k 20
+#   python benchmarks/benchmark_sparse_phate.py --save-config my.yml
+#
+# Every field is optional — omitted fields fall back to the default shown here.
+# Format: .yml and .json are both supported (auto-detected by extension).
+
+# ── Data ──────────────────────────────────────────────────────────────────
+# N values to benchmark with synthetic data.  Each N generates a tree dataset.
+# Ignored when input_dir is set (real data determines its own N).
+sizes: [500, 2000, 5000, 10000, 20000, 50000, 100000]
+
+# Dimensionality of generated synthetic data (512 is realistic for scRNA-seq).
+# Ignored when input_dir is set.
+n_features: 512
+
+# Random seeds used for reproducibility.  Timings are reported as mean ± std
+# across seeds.  Fewer seeds = faster but noisier.
+seeds: [42, 123, 456, 789, 1024]
+
+# Floating-point precision for all data arrays.
+#   float16  — half precision, half the memory, potential numerical issues
+#   float32  — single precision (default), good balance of speed and accuracy
+#   float64  — double precision, highest accuracy, 2× memory of float32
+float_precision: "float32"
+
+# ── Input (real data) ─────────────────────────────────────────────────────
+# Directory of data files, or path to a single file.
+# Leave empty ("") to auto-generate synthetic tree data at the sizes above.
+#
+# Supported formats:
+#   .csv       comma-separated, first column used as row labels if non-numeric
+#   .tsv       tab-separated, same label convention
+#   .parquet   Apache Parquet (pandas)
+#   .npy       NumPy binary
+#   .h5ad      AnnData (scanpy / anndata)
+#
+# Tabular data convention: rows = samples, columns = features.
+# When set, sizes and n_features are ignored — the file shape determines N.
+input_dir: ""
+
+# ── Output ────────────────────────────────────────────────────────────────
+# Directory where benchmark results are saved (CSV tables, plots).
+# Created automatically if it doesn't exist.
+output_dir: "benchmark_results"
+
+# When true, runs sparse-vs-dense comparison plots via --plot-comparison.
+# Set to false to skip plot generation (useful for headless / batch runs).
+plot_on: true
+
+# ── Sparse similarity ─────────────────────────────────────────────────────
+# Number of nearest neighbours retained per row in the sparse similarity
+# matrix.  Higher k = denser matrix = slower but more accurate.
+# Rule of thumb: k >= 2·log₂(N) for tree-structured data.
+sparse_k: 10
+
+# Distance or similarity metric for neighbour search.
+#   euclidean    — keep k smallest distances
+#   cosine       — keep k largest cosine similarities
+#   correlation  — keep k largest Pearson correlations
+sparse_metric: "euclidean"
+
+# Kernel bandwidth σ for the affinity kernel  exp(−d / σ).
+# Smaller values give sharper localisation.  Set to 0 to store raw distances
+# (no kernel applied), though this is rarely useful.
+decay: 40.0
+
+# Rows processed in each batch during sparse similarity construction.
+# Peak memory proportional to batch_size × N.
+# Increase for speed, decrease if you hit OOM.
+batch_size: 256
+
+# ── Backend ───────────────────────────────────────────────────────────────
+# Engine for sparse similarity computation.
+#   torch  — GPU-accelerated (recommended; requires PyTorch)
+#   scipy  — CPU-only, no extra dependencies
+sparse_backend: "torch"
+
+# Device for torch backend.  Ignored when sparse_backend = "scipy".
+#   cpu   — CPU
+#   cuda  — NVIDIA GPU
+#   mps   — Apple Silicon GPU (M1/M2/M3)
+sparse_device: "cpu"
+
+# ── Connectivity ──────────────────────────────────────────────────────────
+# When true, binary-searches for the smallest k that keeps the similarity
+# graph in a single connected component.  Overrides sparse_k.
+# When false, sparse_k is used directly.
+tighten_k: false
+
+# Upper bound for the connectivity binary search (capped at N−1).
+k_max: 200
+
+# ── PHATE parameters ──────────────────────────────────────────────────────
+# kNN used in the dense (graphtools) reference path.
+knn: 5
+
+# Diffusion time t — number of successive matrix powers P^t.
+#   t=1 — immediate neighbours only
+#   t=2 — two-hop reach (default, keeps matrix sparse; NNZ grows as k^t)
+#   t=3-10 — trade off sparsity vs global structure
+#   t="auto" — selected from Von Neumann Entropy knee point
+# Higher t captures more global structure but increases fill-in (density).
+t: 2
+
+# Information distance parameter.
+#   -1  — no log transform (pure diffusion distances)
+#    0  — sqrt transform (balance between local and global)
+#    1  — full log potential (default, emphasises fine structure)
+gamma: 1.0
+
+# MDS variant for the final embedding.
+#   classic   — classical (PCoA) MDS
+#   metric    — metric MDS (stress minimisation)
+#   nonmetric — non-metric MDS (ordinal)
+mds_how: "metric"
+
+# Solver used by metric/nonmetric MDS.
+#   sgd    — Stochastic Gradient Descent (fast, approximate, 7-10× SMACOF)
+#   smacof — SMACOF via sklearn (exact, slower)
+mds_solver: "sgd"
+
+# Number of embedding dimensions (2 for scatter plots, 3 for 3D).
+n_components: 2
+
+# ── Benchmark selection ───────────────────────────────────────────────────
+# Toggle individual benchmarks.  All run by default.
+# Use e.g. '--no-spectral' to skip one, or '--similarity' to run only that.
+
+run_similarity: true     # 1. Sparse similarity timing across backends & metrics
+run_connectivity: true   # 2. Minimal connected k scaling (k ~ N^α power law)
+run_spectral: true       # 3. Eigenvalue fidelity & VNE correlation vs dense
+run_fill_in: true        # 4. Diffusion power fill-in density per step
+run_mds: true            # 5. MDS timing (sparse vs dense) across sizes
+run_end_to_end: true     # 6. Full PHATE pipeline end-to-end at each N
