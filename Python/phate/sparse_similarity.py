@@ -11,17 +11,12 @@ the sparse result. For N=20000, batch_size=256, float64: ~40 MB peak.
 
 import numpy as np
 import tasklogger
+import torch
+from rich.progress import BarColumn, Progress, TextColumn, TimeRemainingColumn
 from scipy import sparse
 from scipy.sparse import coo_matrix, issparse
 from scipy.sparse.csgraph import connected_components
 from scipy.spatial.distance import cdist
-
-try:
-    import torch
-
-    _has_torch = True
-except ImportError:
-    _has_torch = False
 
 _logger = tasklogger.get_tasklogger("graphtools")
 
@@ -84,7 +79,20 @@ def compute_sparse_similarity(
         f"batch_size={batch_size}..."
     )
 
-    for batch_start in range(0, n_samples, batch_size):
+    n_batches = (n_samples + batch_size - 1) // batch_size
+    progress = None
+    if verbose > 0:
+        progress = Progress(
+            TextColumn("  [bold blue]{task.description}"),
+            BarColumn(),
+            TextColumn("{task.percentage:>5.0f}%"),
+            TimeRemainingColumn(),
+        )
+        task = progress.add_task("Sparse similarity", total=n_batches)
+        progress.start()
+
+    for batch_idx in range(n_batches):
+        batch_start = batch_idx * batch_size
         batch_end = min(batch_start + batch_size, n_samples)
         batch = X[batch_start:batch_end]  # (batch_sz, n_features)
 
@@ -96,20 +104,17 @@ def compute_sparse_similarity(
             row = pair[i]
 
             if is_similarity:
-                # Keep k largest similarity values
                 if k < n_samples:
                     idx = np.argpartition(-row, k)[:k]
                 else:
                     idx = np.arange(n_samples)
                 top_vals = row[idx].astype(np.float64, copy=True)
             else:
-                # Keep k smallest distances, then apply kernel
                 if k < n_samples:
                     idx = np.argpartition(row, k)[:k]
                 else:
                     idx = np.arange(n_samples)
                 top_vals = row[idx].astype(np.float64, copy=True)
-                # Alpha-decaying kernel: exp(-d / decay), unselected = 0
                 if decay is not None:
                     np.exp(-top_vals / decay, out=top_vals)
 
@@ -117,8 +122,13 @@ def compute_sparse_similarity(
             all_cols.extend(idx)
             all_vals.extend(top_vals)
 
-        if verbose > 0 and (batch_end % (batch_size * 10) == 0 or batch_end == n_samples):
+        if progress is not None:
+            progress.update(task, advance=1)
+        elif verbose > 0 and (batch_end % (batch_size * 10) == 0 or batch_end == n_samples):
             _logger.log_info(f"  Processed {batch_end}/{n_samples} samples...")
+
+    if progress is not None:
+        progress.stop()
 
     n_entries = len(all_rows)
     _logger.log_info(f"Building sparse matrix with {n_entries} entries...")
@@ -177,12 +187,6 @@ def compute_sparse_similarity_torch(
     -------
     S : scipy.sparse.csr_matrix
     """
-    if not _has_torch:
-        _logger.log_info("Torch not available; falling back to scipy.")
-        return compute_sparse_similarity(
-            X, k=k, metric=metric, decay=decay, batch_size=batch_size, verbose=verbose
-        )
-
     n_samples = X.shape[0]
     k = min(k, n_samples)
     is_similarity = metric in {"cosine", "correlation"}
@@ -199,28 +203,36 @@ def compute_sparse_similarity_torch(
     all_cols = []
     all_vals = []
 
-    for batch_start in range(0, n_samples, batch_size):
+    n_batches = (n_samples + batch_size - 1) // batch_size
+    progress = None
+    if verbose > 0:
+        progress = Progress(
+            TextColumn("  [bold green]{task.description}"),
+            BarColumn(),
+            TextColumn("{task.percentage:>5.0f}%"),
+            TimeRemainingColumn(),
+        )
+        task = progress.add_task(f"Sparse similarity (torch, {device})", total=n_batches)
+        progress.start()
+
+    for batch_idx in range(n_batches):
+        batch_start = batch_idx * batch_size
         batch_end = min(batch_start + batch_size, n_samples)
         batch = X_t[batch_start:batch_end]
 
         if metric == "correlation":
-            # Correlation via matrix multiplication: much faster than cdist
-            # z-score the batch and full data
             b_centered = batch - batch.mean(dim=1, keepdim=True)
             b_norm = b_centered / (b_centered.std(dim=1, keepdim=True) + 1e-10)
             x_centered = X_t - X_t.mean(dim=1, keepdim=True)
             x_norm = x_centered / (x_centered.std(dim=1, keepdim=True) + 1e-10)
-            # Correlation distance = 1 - correlation (matches scipy cdist)
-            pair = 1 - b_norm @ x_norm.T  # (batch_sz, n_samples)
+            pair = 1 - b_norm @ x_norm.T
         elif metric == "cosine":
-            # Cosine distance = 1 - normalized dot product (matches scipy cdist)
             b_norm = batch / (batch.norm(dim=1, keepdim=True) + 1e-10)
             x_norm = X_t / (X_t.norm(dim=1, keepdim=True) + 1e-10)
             pair = 1 - b_norm @ x_norm.T
         else:
-            pair = torch.cdist(batch, X_t)  # (batch_sz, n_samples)
+            pair = torch.cdist(batch, X_t)
 
-        # Top-k selection
         if is_similarity:
             top_vals, top_idx = torch.topk(pair, k, dim=1, largest=True)
         else:
@@ -229,7 +241,6 @@ def compute_sparse_similarity_torch(
         top_vals = top_vals.cpu().numpy().astype(np.float64)
         top_idx = top_idx.cpu().numpy()
 
-        # Apply kernel for distance metrics
         if decay is not None and not is_similarity:
             top_vals = np.exp(-top_vals / decay)
 
@@ -239,8 +250,13 @@ def compute_sparse_similarity_torch(
             all_cols.extend(top_idx[i])
             all_vals.extend(top_vals[i])
 
-        if verbose > 0 and (batch_end % (batch_size * 10) == 0 or batch_end == n_samples):
+        if progress is not None:
+            progress.update(task, advance=1)
+        elif verbose > 0 and (batch_end % (batch_size * 10) == 0 or batch_end == n_samples):
             _logger.log_info(f"  Processed {batch_end}/{n_samples} samples...")
+
+    if progress is not None:
+        progress.stop()
 
     n_entries = len(all_rows)
     _logger.log_info(f"Building sparse matrix with {n_entries} entries...")
@@ -327,27 +343,27 @@ def check_connectivity(S):
 
 def find_minimal_k(
     X,
+    k_start=100,
     k_max=1000,
-    k_min=1,
     metric="euclidean",
     decay=40,
     batch_size=256,
     verbose=1,
 ):
-    """Binary search for the minimal k that maintains graph connectivity.
+    """Scale-up search for a k that maintains graph connectivity.
 
-    Starts by verifying that k_max produces a connected graph. Then
-    binary-searches between k_min and k_max for the smallest k that
-    still yields a single connected component.
+    Starts with a sufficient assumption (k_start) and doubles until
+    the graph is connected or k_max is reached. Much faster than
+    binary search when the default k_start is already sufficient.
 
     Parameters
     ----------
     X : ndarray, shape=[n_samples, n_features]
         Input data matrix.
+    k_start : int
+        Initial k to try (should be generous enough for typical data).
     k_max : int
-        Upper bound for k (must be large enough for connectivity).
-    k_min : int
-        Lower bound for k.
+        Upper bound for k (capped at n_samples - 1).
     metric : str
         Distance/similarity metric.
     decay : float or None
@@ -360,53 +376,39 @@ def find_minimal_k(
     Returns
     -------
     k_opt : int
-        Minimal k achieving connectivity.
+        k achieving connectivity (first value that works).
     S : scipy.sparse.csr_matrix
         Sparse similarity matrix at k_opt.
+    n_components : int
+        Number of connected components at k_opt (1 if connected).
     """
     n_samples = X.shape[0]
     k_max = min(k_max, n_samples - 1)
-    k_min = max(k_min, 1)
+    k = min(k_start, k_max)
 
     _logger.log_info(
-        f"Finding minimal k for connectivity on {n_samples} samples "
-        f"(searching [{k_min}, {k_max}])..."
+        f"Finding k for connectivity on {n_samples} samples "
+        f"(start={k_start}, max={k_max})..."
     )
 
-    # Verify k_max works
-    S_max = compute_sparse_similarity(
-        X, k=k_max, metric=metric, decay=decay,
-        batch_size=batch_size, verbose=max(verbose - 1, 0)
-    )
-    n_comp, _ = check_connectivity(S_max)
-    if n_comp > 1:
-        raise ValueError(
-            f"Graph is disconnected even with k=k_max={k_max} "
-            f"({n_comp} components). Increase k_max."
+    n_comp = None
+    while k <= k_max:
+        _logger.log_info(f"Testing k={k}...")
+        S = compute_sparse_similarity(
+            X, k=k, metric=metric, decay=decay,
+            batch_size=batch_size, verbose=max(verbose - 1, 0)
         )
-    _logger.log_info(f"k_max={k_max} is connected ✓")
-
-    # Binary search
-    lo, hi = k_min, k_max
-    best_S = S_max
-
-    while lo < hi:
-        mid = (lo + hi) // 2
-        _logger.log_debug(f"Testing k={mid} [{lo}, {hi}]...")
-        S_mid = compute_sparse_similarity(
-            X, k=mid, metric=metric, decay=decay,
-            batch_size=batch_size, verbose=0
-        )
-        n_comp, _ = check_connectivity(S_mid)
-
+        n_comp, labels = check_connectivity(S)
         if n_comp == 1:
-            hi = mid
-            best_S = S_mid
-            _logger.log_debug(f"  k={mid} connected, searching lower half")
-        else:
-            lo = mid + 1
-            _logger.log_debug(f"  k={mid} disconnected ({n_comp} components), "
-                              f"searching upper half")
+            _logger.log_info(f"Connected at k={k} ✓")
+            return k, S, 1
+        _logger.log_info(f"  {n_comp} components, scaling up...")
+        if k == k_max:
+            break
+        k = min(k * 2, k_max)
 
-    _logger.log_info(f"Minimal k for connectivity: {lo}")
-    return lo, best_S
+    _logger.log_info(
+        f"Still disconnected at k_max={k_max} ({n_comp} components). "
+        f"Data may have genuinely disconnected manifolds."
+    )
+    return k, S, n_comp

@@ -7,9 +7,11 @@ Potential of Heat-diffusion for Affinity-based Trajectory Embedding (PHATE)
 
 import warnings
 
+import anndata
 import graphtools
 import matplotlib.pyplot as plt
 import numpy as np
+import pygsp
 import tasklogger
 from packaging import version
 from scipy import sparse
@@ -17,18 +19,6 @@ from sklearn.base import BaseEstimator
 from sklearn.exceptions import NotFittedError
 
 from . import mds, sparse_similarity, utils, vne
-
-try:
-    import anndata
-except ImportError:
-    # anndata not installed
-    pass
-
-try:
-    import pygsp
-except ImportError:
-    # anndata not installed
-    pass
 
 _logger = tasklogger.get_tasklogger("graphtools")
 
@@ -202,7 +192,7 @@ class PHATE(BaseEstimator):
         random_landmarking=False,
         sparse_k=None,
         sparse_metric="euclidean",
-        sparse_backend="scipy",
+        sparse_backend="torch",
         sparse_device="cpu",
         sparse_batch_size=256,
         verbose=1,
@@ -784,26 +774,18 @@ class PHATE(BaseEstimator):
             update_graph = False
             return X, n_pca, precomputed, update_graph
         else:
-            try:
-                if isinstance(X, pygsp.graphs.Graph):
-                    self.graph = None
-                    X = X.W
-                    precomputed = "adjacency"
-                    update_graph = False
-                    n_pca = None
-                    return X, n_pca, precomputed, update_graph
-            except NameError:
-                # pygsp not installed
-                pass
+            if isinstance(X, pygsp.graphs.Graph):
+                self.graph = None
+                X = X.W
+                precomputed = "adjacency"
+                update_graph = False
+                n_pca = None
+                return X, n_pca, precomputed, update_graph
 
         # checks on regular data
         update_graph = True
-        try:
-            if isinstance(X, anndata.AnnData):
-                X = X.X
-        except NameError:
-            # anndata not installed
-            pass
+        if isinstance(X, anndata.AnnData):
+            X = X.X
         if not callable(self.knn_dist) and self.knn_dist.startswith("precomputed"):
             if self.knn_dist == "precomputed":
                 # automatic detection
@@ -1066,7 +1048,7 @@ class PHATE(BaseEstimator):
             )
             if self.embedding is None:
                 with _logger.log_task(f"{self.mds} MDS"):
-                    pot_is_pairwise = sparse.issparse(self._diff_potential)
+                    pot_is_pairwise = False
                     self.embedding = mds.embed_MDS(
                         diff_potential,
                         ndim=self.n_components,
@@ -1077,6 +1059,7 @@ class PHATE(BaseEstimator):
                         seed=self.random_state,
                         verbose=max(self.verbose - 1, 0),
                         is_pairwise=pot_is_pairwise,
+                        _is_sparse_mds=(self._sparse_diff_op is not None),
                     )
             if isinstance(self.graph, graphtools.graphs.LandmarkGraph):
                 _logger.log_debug("Extending to original data...")
@@ -1149,39 +1132,14 @@ class PHATE(BaseEstimator):
                 if sparse.issparse(diff_op):
                     # Sparse matrix power with stepwise density monitoring
                     t_int = int(t)
-                    n_sq = diff_op.shape[0] * diff_op.shape[1]
                     _logger.log_debug(
                         f"Computing sparse diffusion operator to power t={t_int} "
                         f"(nnz={diff_op.nnz})..."
                     )
+                    # P^t via repeated matmul: start with P, multiply t-1 times
                     diff_op_t = diff_op
-                    for _step in range(t_int):
+                    for _step in range(t_int - 1):
                         diff_op_t = diff_op_t @ diff_op
-                        density = diff_op_t.nnz / n_sq
-                        if density > 0.3 and _step < t_int - 1:
-                            remaining = t_int - _step - 1
-                            _logger.log_debug(
-                                f"Crossed 30% density threshold at step {_step + 1}/{t_int} "
-                                f"({density:.1%}); switching to dense for remaining "
-                                f"{remaining} step(s)."
-                            )
-                            diff_op_t = np.linalg.matrix_power(
-                                diff_op_t.toarray(), remaining
-                            )
-                            break
-                    if sparse.issparse(diff_op_t):
-                        density = diff_op_t.nnz / n_sq
-                        if density > 0.3:
-                            _logger.log_debug(
-                                f"Diffusion operator {density:.1%} dense after "
-                                f"powering; converting to dense array."
-                            )
-                            diff_op_t = diff_op_t.toarray()
-                        else:
-                            _logger.log_debug(
-                                f"Diffusion operator {density:.1%} dense after powering; "
-                                f"keeping sparse."
-                            )
                 else:
                     diff_op_t = np.linalg.matrix_power(diff_op, t)
                 if self.gamma == 1:

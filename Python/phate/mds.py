@@ -146,6 +146,29 @@ def smacof(
     return Y
 
 
+def _sparse_row_pdist(X):
+    """Compute pairwise Euclidean distances between rows of a sparse matrix.
+
+    Uses the identity  dist²(i,j) = ||row_i||² + ||row_j||² - 2·row_i·row_j
+    to avoid materializing a dense copy of X.  The result is a dense N×N
+    float32 array.
+    """
+    # Row norms squared (keep sparse)
+    X_sq = X.copy()
+    X_sq.data **= 2
+    row_norms_sq = np.array(X_sq.sum(axis=1)).ravel().astype(np.float32)
+
+    # Dot products between rows: X @ X.T
+    # Use float32 for the dense result to halve memory
+    dot = (X @ X.T).toarray().astype(np.float32)
+
+    # D[i,j] = sqrt(max(0, ||row_i||² + ||row_j||² - 2·row_i·row_j))
+    D_sq = row_norms_sq[:, np.newaxis] + row_norms_sq[np.newaxis, :]
+    D_sq -= 2 * dot
+    np.maximum(D_sq, 0, out=D_sq)
+    return np.sqrt(D_sq, dtype=np.float32)
+
+
 def embed_MDS(
     X,
     ndim=2,
@@ -156,6 +179,7 @@ def embed_MDS(
     seed=None,
     verbose=0,
     is_pairwise=False,
+    _is_sparse_mds=False,
 ):
     """Performs classic, metric, and non-metric MDS
 
@@ -218,30 +242,30 @@ def embed_MDS(
             f"'{solver}' was passed."
         )
 
-    # MDS embeddings, each gives a different output.
-    if is_pairwise:
-        # X is already a pairwise dissimilarity matrix; skip distance computation
-        if sparse.issparse(X):
-            X_dist = X  # keep sparse for SGD-MDS, densify only if needed
-        else:
-            X_dist = np.asarray(X)
+    # ── Sparse input: randomized SVD directly on the sparse matrix ──
+    # Classical MDS on Euclidean distances = PCA on the data rows.
+    # Randomized SVD on sparse X creates only N×k intermediates,
+    # never a dense N×N matrix.  O(N·nnz·k) time, O(N·k + nnz) memory.
+    _X_is_sparse = sparse.issparse(X)
+    if _X_is_sparse and (how == "classic" or _is_sparse_mds):
+        from sklearn.utils.extmath import randomized_svd
+
+        U, S, Vt = randomized_svd(
+            X, n_components=ndim, random_state=seed, n_iter=4)
+        return U[:, :ndim] * S[:ndim]
+
+    if _X_is_sparse and not is_pairwise:
+        X_dist = _sparse_row_pdist(X)
+    elif is_pairwise:
+        X_dist = np.asarray(X.toarray() if _X_is_sparse else X)
+    elif distance_metric == "euclidean" and X.shape[0] > 1000:
+        from sklearn.metrics.pairwise import euclidean_distances
+
+        X_dist = euclidean_distances(X, X)
     else:
-        # Handle sparse input: densify for pdist/euclidean_distances compatibility
-        if sparse.issparse(X):
-            X = X.toarray()
+        X_dist = squareform(pdist(X, distance_metric))
 
-        # For large n (>1000), use optimized euclidean_distances from sklearn
-        # which is much faster than scipy's pdist + squareform
-        if distance_metric == "euclidean" and X.shape[0] > 1000:
-            from sklearn.metrics.pairwise import euclidean_distances
-
-            X_dist = euclidean_distances(X, X)
-        else:
-            X_dist = squareform(pdist(X, distance_metric))
-
-    # Check for degenerate distance matrix before calling classic MDS
-    # This happens with extreme hyperparameters (e.g., KNN close to dataset size)
-    # causing complete diffusion homogeneity
+    # Check for degenerate distance matrix
     if sparse.issparse(X_dist):
         _dist_check = X_dist.data
     else:
@@ -258,7 +282,7 @@ def embed_MDS(
         )
         return np.zeros((X_dist.shape[0], ndim))
 
-    # Classic MDS requires dense: densify if needed
+    # Classic MDS requires dense
     X_dense = X_dist.toarray() if sparse.issparse(X_dist) else X_dist
     Y_classic = classic(X_dense, n_components=ndim, random_state=seed)
     if how == "classic":

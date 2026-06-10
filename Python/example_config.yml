@@ -1,0 +1,35 @@
+# Sparse PHATE configuration
+# Usage: uv run python cli.py -c example_config.yml
+#
+# All fields optional except input and output.
+# CLI flags override YAML values.
+
+# ── I/O ──
+input: data.parquet              # .parquet, .csv, .tsv, .npy, .h5ad
+output: embedding.parquet
+
+# ── Sparse similarity ──
+sparse_k: 10                     # top-k neighbors per row
+sparse_metric: euclidean         # euclidean | cosine | correlation
+decay: 40.0                      # kernel decay sigma
+batch_size: 256                  # rows per batch (controls peak memory)
+sparse_device: cpu               # cpu | cuda | mps
+
+# ── Diffusion ──
+t: 2                             # diffusion time steps
+gamma: 1.0                       # potential: -1..1 (log=1, sqrt=0)
+
+# ── Embedding ──
+n_components: 2                  # output dimensions
+
+# ── Plots (optional) ──
+# plot_dir: plots                # output directory for plots
+# plot_format: png               # png | html
+
+# ── GPU example ──
+# sparse_device: cuda
+# batch_size: 1024               # larger batches for GPU
+
+# ── Misc ──
+verbose: true
+# no_header: false               # set true for CSV/TSV without header row

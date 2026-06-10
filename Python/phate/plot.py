@@ -2,13 +2,9 @@
 # (C) 2017 Krishnaswamy Lab GPLv2
 
 # Plotting convenience functions
-from .phate import PHATE
+import anndata
 
-try:
-    import anndata
-except ImportError:
-    # anndata not installed
-    pass
+from .phate import PHATE
 
 
 def _get_plot_data(data, ndim=None):
@@ -23,19 +19,14 @@ def _get_plot_data(data, ndim=None):
     out = data
     if isinstance(data, PHATE):
         out = data.transform()
-    else:
+    elif isinstance(data, anndata.AnnData):
         try:
-            if isinstance(data, anndata.AnnData):
-                try:
-                    out = data.obsm["X_phate"]
-                except KeyError:
-                    raise RuntimeError(
-                        "data.obsm['X_phate'] not found. "
-                        "Please run `sc.tl.phate(adata)` before plotting."
-                    )
-        except NameError:
-            # anndata not installed
-            pass
+            out = data.obsm["X_phate"]
+        except KeyError:
+            raise RuntimeError(
+                "data.obsm['X_phate'] not found. "
+                "Please run `sc.tl.phate(adata)` before plotting."
+            )
     if ndim is not None and out[0].shape[0] < ndim:
         if isinstance(data, PHATE):
             data.set_params(n_components=ndim)

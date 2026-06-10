@@ -20,11 +20,17 @@ dependencies = [
     "numpy>=1.20.0",
     "scipy>=1.7.0",
     "scikit-learn>=1.5.0",
+    "pandas",
+    "pyarrow",
     "future",
     "tasklogger>=1.2",
     "graphtools>=2.1.0",
+    "anndata",
+    "pygsp",
     "Deprecated",
     "matplotlib>=3.0",
+    "torch",
+    "rich",
 ]
 keywords = [
     "visualization",
@@ -62,7 +68,7 @@ Repository = "https://github.com/KrishnaswamyLab/PHATE"
 Download = "https://github.com/KrishnaswamyLab/PHATE/archive/v{version}.tar.gz"
 
 [project.optional-dependencies]
-test = ["pytest", "anndata", "coverage", "coveralls", "ruff"]
+test = ["pytest", "coverage", "coveralls", "ruff"]
 doc = ["sphinx", "sphinxcontrib-napoleon"]
 
 

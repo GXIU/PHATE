@@ -11,21 +11,27 @@ from scipy.io import loadmat
 def gen_dla(
     n_dim=100, n_branch=20, branch_length=100, rand_multiplier=2, seed=37, sigma=4
 ):
+    """Generate fractal tree data via Diffusion-Limited Aggregation.
+
+    O(N·d) time/memory via pre-allocation. Scales to N=500K+.
+    """
     np.random.seed(seed)
-    M = np.cumsum(-1 + rand_multiplier * np.random.rand(branch_length, n_dim), 0)
-    for i in range(n_branch - 1):
-        ind = np.random.randint(branch_length)
+    N = n_branch * branch_length
+    M = np.empty((N, n_dim))
+
+    steps = -1 + rand_multiplier * np.random.rand(branch_length, n_dim)
+    M[:branch_length] = np.cumsum(steps, axis=0)
+
+    for i in range(1, n_branch):
+        start = i * branch_length
+        ind = np.random.randint(start)
         new_branch = np.cumsum(
-            -1 + rand_multiplier * np.random.rand(branch_length, n_dim), 0
+            -1 + rand_multiplier * np.random.rand(branch_length, n_dim), axis=0
         )
-        M = np.concatenate([M, new_branch + M[ind, :]])
+        M[start : start + branch_length] = new_branch + M[ind]
 
-    noise = np.random.normal(0, sigma, M.shape)
-    M = M + noise
-
-    # returns the group labels for each point to make it easier to visualize
-    # embeddings
-    C = np.array([i // branch_length for i in range(n_branch * branch_length)])
+    M += np.random.normal(0, sigma, M.shape)
+    C = np.repeat(np.arange(n_branch), branch_length)
 
     return M, C
 
