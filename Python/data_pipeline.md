@@ -1,4 +1,25 @@
-# Sparse PHATE Data Pipeline
+# Sparse PHATE — Data Pipeline & Benchmarks
+
+## Architecture
+
+```
+┌──────────┐    ┌───────────────┐    ┌──────────────┐    ┌────────────┐    ┌──────────┐
+│  Input   │    │   Sparse      │    │  Diffusion   │    │    MDS      │    │  Output  │
+│  data    │───→│   Similarity  │───→│  Potential   │───→│  (rand SVD) │───→│  embed   │
+│  N × d   │    │  (CSR, ~N·k)  │    │  (CSR, P^t)  │    │  (CSR→N×2)  │    │  N × 2   │
+└──────────┘    └───────────────┘    └──────────────┘    └────────────┘    └──────────┘
+                     O(N·d·k)           O(N·k²·t)           O(N·k·ndim)
+
+  No dense N×N matrix at any step. All intermediates stay sparse CSR.
+```
+
+**Key design decisions:**
+- Batched top-k similarity via `torch.cdist` — 50× faster than `scipy.cdist`
+- Diffusion operator stays sparse CSR throughout — stepwise `P @ P` with no densification threshold
+- MDS via `sklearn.randomized_svd` on sparse CSR — creates only N×ndim intermediates, never N×N
+- All dependencies are core (no optional extras): torch, rich, anndata, pygsp, pandas, pyarrow
+
+---
 
 ## 1. Generate Tree Data → Parquet
 
@@ -10,7 +31,7 @@ from phate.tree import gen_dla
 data, clusters = gen_dla(
     n_dim=512, n_branch=100, branch_length=500, seed=42
 )
-# data: (50000, 512) float64 — 100 branches × 500 points each
+# (50000, 512) — 100 branches × 500 points each, ~5s generation
 
 df = pd.DataFrame(data.astype(np.float32))
 df.insert(0, 'branch', clusters.astype(np.int32))
@@ -18,98 +39,120 @@ df.to_parquet('tree_50k.parquet', index=False)
 "
 ```
 
-Output: `tree_50k.parquet` — 153 MB, 50,000 rows × 513 columns (`branch` + 512 features).
+| Output | Rows | Columns | Size |
+|--------|------|---------|------|
+| `tree_50k.parquet` | 50,000 | 513 (branch + 512 features) | 153 MB |
+| `tree_500k.parquet` | 500,000 | 513 | 1.3 GB |
 
-## 2. YAML Configuration
+`gen_dla` uses pre-allocation — O(N·d) time, scales to N=500K in ~5s.
+
+---
+
+## 2. Configure via YAML
 
 `pipeline_50k.yml`:
 
 ```yaml
 input: tree_50k.parquet
 output: embedding_50k.parquet
-sparse_k: 50
+sparse_k: 100
 sparse_metric: euclidean
 decay: 40.0
 batch_size: 256
-sparse_device: cpu
+sparse_device: cpu    # or cuda, mps
 t: 2
 gamma: 1.0
 n_components: 2
 plot_dir: plots
-plot_format: png
+plot_format: png       # or html (interactive plotly)
 verbose: true
 ```
 
-## 3. Run Sparse PHATE
+## 3. Run CLI
 
 ```bash
 uv run python cli.py -c pipeline_50k.yml
+
+# Override any field from CLI
+uv run python cli.py -c pipeline_50k.yml -t 8 --sparse-k 50 --device cuda
+
+# Print resolved config
+uv run python cli.py -c pipeline_50k.yml --show-config
 ```
 
-Output:
-```
-Loaded tree_50k.parquet: (50000, 513), float32, 0.1s
-PHATE: k=50, t=2, gamma=1.0, metric=euclidean, ndim=2, device=cpu
-  Sparse similarity (torch, cpu) ─── 100%
-    Result: 2,756,490 non-zeros (0.110% dense)
-  Calculated sparse similarity and diffusion operator in 5.13 seconds.
-  Calculated diffusion potential in 0.19 seconds.
-  Calculated metric MDS in 0.22 seconds.
-Done: 6.9s, embedding=(50000, 2)
-Saved: embedding_50k.parquet
-Plot: plots/phate_embedding.png
-```
+---
 
-**No dense N×N matrix at any step.** All intermediate matrices stay sparse CSR.
+## 4. Benchmarks
 
-## 4. Output
+### Scale (d=100, k=10, t=2)
 
-**`embedding_50k.parquet`** — 50,000 rows × 2 columns (`x_0`, `x_1`):
+| N | Similarity | P² | MDS | **Total** | S nnz | P^t nnz | P^t density |
+|---|-----------|-----|-----|-------|--------|----------|-------------|
+| 10K | 0.1s | 0.04s | 0.3s | **0.5s** | 172K | 7.5M | 7.5% |
+| 20K | 0.3s | 0.10s | 0.6s | **1.1s** | 346K | 16.9M | 4.2% |
+| 50K | 2.2s | 0.31s | 1.6s | **4.4s** | 869K | 44.4M | 1.8% |
+| 100K | 8.2s | 0.85s | 4.0s | **13.8s** | 1.7M | 104M | 1.0% |
+| 200K | 34.2s | 2.40s | 19.3s | **57.6s** | 3.5M | 234M | 0.6% |
 
-| x_0 | x_1 |
-|-----|-----|
-| 0.65 | 4.61 |
-| 0.70 | 5.23 |
-| ... | ... |
+### Dense (original, knn=5) vs Sparse (k=30) — N=2000, d=100
 
-Embedding range: x_0 ∈ [-6.5, 96.9], x_1 ∈ [-6.5, 95.2].
+| t | Dense | Sparse | Speedup |
+|---|-------|--------|---------|
+| 1 | 3.3s | 0.1s | 33× |
+| 2 | 3.2s | 0.1s | 32× |
+| 4 | 4.8s | 0.4s | 12× |
+| 8 | 18.4s | 2.1s | 9× |
 
-**Plot:** `plots/phate_embedding.png` — scatter colored by branch label.
+Plot: `plots/dense_vs_sparse.png` — side-by-side comparison colored by branch.
 
-## Pipeline Summary
+### t=1..10 × k=[10, 50, 100] — N=50,000, d=512
 
-```
-┌──────────────┐     ┌──────────────────┐     ┌────────────┐
-│ tree_50k     │ ──→ │ sparse PHATE     │ ──→ │ embedding  │
-│ .parquet     │     │ (all sparse CSR) │     │ .parquet   │
-│ 50K × 512    │     │                  │     │ 50K × 2    │
-│ 153 MB       │     │ sim:   5.1s      │     │ + plot.png │
-│              │     │ diff:  0.2s      │     │            │
-│              │     │ MDS:   0.2s      │     │            │
-│              │     │ total: 5.6s      │     │            │
-└──────────────┘     └──────────────────┘     └────────────┘
-```
+| k\t | 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 | 9 | 10 |
+|------|---|---|---|---|---|---|---|---|---|------|----|
+| 10 | 9.7s | 9.7s | 10.0s | 10.2s | 13.1s | 11.3s | 11.3s | 11.7s | 11.9s | 12.2s |
+| 50 | 10.9s | 11.3s | 11.7s | 12.7s | 15.6s | 16.5s | 19.0s | 21.4s | 27.6s | 30.9s |
+| 100 | 17.5s | 17.6s | 24.7s | 25.8s | 32.9s | 55.3s | 106.9s | 129.1s | 60.2s | 77.3s |
 
-### Scaling to N=500,000
+Plot: `plots/t_k_grid.png` — 3×10 grid, each panel is a PHATE embedding.
+
+**Observations:**
+- k=10: minimal fill-in, t has little effect on runtime (density stays low)
+- k=50: moderate fill-in, runtime grows 3× from t=1 to t=10
+- k=100: heavy fill-in, P^t approaches dense matrix — runtime spikes at t=7-8
+- Recommendation: for tree data, k=50 at t≤4 gives best speed/quality tradeoff
+
+---
+
+## 5. Scripts
 
 ```bash
-uv run python -c "
-from phate.tree import gen_dla
-import pandas as pd
+# Grid search: t=1..10 × k=[10, 50, 100]
+uv run python scripts/t_k_grid.py
 
-data, clusters = gen_dla(
-    n_dim=512, n_branch=500, branch_length=1000, seed=42
-)
-df = pd.DataFrame(data.astype(np.float32))
-df.insert(0, 'branch', clusters.astype(np.int32))
-df.to_parquet('tree_500k.parquet', index=False)
-"
+# Dense vs sparse comparison
+uv run python scripts/dense_vs_sparse.py
 ```
 
-Generates `tree_500k.parquet` (1.3 GB, 500,000 × 512) in ~5 seconds.
+---
 
-For GPU acceleration, set `sparse_device: cuda` in the YAML:
+## 6. Build & Install
+
+```bash
+# Build wheel
+uv build --wheel
+# → dist/phate-2.0.0-py3-none-any.whl
+
+# Install
+uv pip install dist/phate-2.0.0-py3-none-any.whl
+```
+
+---
+
+## 7. GPU Acceleration
+
+Set `sparse_device: cuda` in YAML (or `--device cuda` on CLI). The similarity computation (torch.cdist) is the dominant cost at large N and benefits most from GPU.
+
 ```yaml
 sparse_device: cuda
-batch_size: 1024
+batch_size: 1024   # larger batches on GPU
 ```
