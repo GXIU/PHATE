@@ -1130,15 +1130,33 @@ class PHATE(BaseEstimator):
                 # diffused diffusion operator
                 diff_op = self.diff_op
                 if sparse.issparse(diff_op):
-                    # Sparse matrix power with stepwise density monitoring
+                    # Sparse matrix power with stepwise density monitoring.
+                    # Each matmul fills in nonzeros; at high density, sparse
+                    # format overhead (row/col index arrays) exceeds dense
+                    # memory, causing ArrayMemoryError. When fill exceeds 30%,
+                    # densify and finish with np.linalg.matrix_power.
                     t_int = int(t)
+                    n = diff_op.shape[0]
+                    total_elements = n * n
                     _logger.log_debug(
                         f"Computing sparse diffusion operator to power t={t_int} "
                         f"(nnz={diff_op.nnz})..."
                     )
-                    # P^t via repeated matmul: start with P, multiply t-1 times
                     diff_op_t = diff_op
-                    for _step in range(t_int - 1):
+                    for step in range(t_int - 1):
+                        fill_ratio = diff_op_t.nnz / total_elements
+                        if fill_ratio > 0.3:
+                            _logger.log_debug(
+                                f"Densifying at step {step + 1}/{t_int} "
+                                f"(fill={fill_ratio:.2%})"
+                            )
+                            diff_op_t = diff_op_t.toarray()
+                            diff_op_dense = diff_op.toarray()
+                            remaining = t_int - (step + 1)
+                            diff_op_t = diff_op_t @ np.linalg.matrix_power(
+                                diff_op_dense, remaining
+                            )
+                            break
                         diff_op_t = diff_op_t @ diff_op
                 else:
                     diff_op_t = np.linalg.matrix_power(diff_op, t)
